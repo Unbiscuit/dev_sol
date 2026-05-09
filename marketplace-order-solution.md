@@ -580,10 +580,10 @@ sequenceDiagram
 
     par Параллельная обработка
         Kafka->>Inventory: ConfirmReservations
-        Inventory->>Inventory: status RESERVED → CONFIRMED
+        Inventory->>Inventory: status RESERVED → CONFIRMED в Inventory DB
     and
         Kafka->>Projector: OrderPaid
-        Projector->>Projector: UPDATE orders_view SET status='PAID'
+        Projector->>Projector: UPDATE orders_view в Read-Model DB
     end
 ```
 
@@ -612,8 +612,10 @@ sequenceDiagram
     participant OMSDB as OMS DB (shard)
     participant Kafka
     participant Inventory
+    participant InvDB as Inventory DB
+    participant InvRedis as Redis
 
-    Worker->>OMSDB: SELECT WHERE deadline < now()-2m AND status='PENDING_PAYMENT'<br/>FOR UPDATE SKIP LOCKED LIMIT 100
+    Worker->>OMSDB: SELECT WHERE deadline < now()-2m AND status='PENDING_PAYMENT' FOR UPDATE SKIP LOCKED LIMIT 100
     OMSDB-->>Worker: [order_ids batch]
 
     loop для каждого order
@@ -627,8 +629,8 @@ sequenceDiagram
     Note over OMSDB, Kafka: Debezium → Kafka
     Kafka->>Inventory: OrderCancelled
     loop для каждого reservation_id
-        Inventory->>Inventory: SELECT FOR UPDATE; if status=ACTIVE then UPDATE status='RELEASED'
-        Inventory->>Inventory: INCRBY stock в Redis
+        Inventory->>InvDB: SELECT FOR UPDATE и UPDATE status в RELEASED если ACTIVE
+        Inventory->>InvRedis: INCRBY stock на quantity
     end
 ```
 
