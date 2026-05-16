@@ -2,9 +2,9 @@
 
 ## 1. Введение
 
-«Заказ товара на маркетплейсе» — это техническое решение для системы оформления заказов в B2C-маркетплейсе с многими селлерами. Проект сосредоточен на критическом пути от инициации чекаута до подтверждения оплаты заказа и его передачи в фулфилмент. Архитектура построена с учётом высоких нагрузок (целевая аудитория 30 млн MAU, до 150 RPS на запись и 10k RPS на чтение в пиковых сценариях), требований к финансовой консистентности и устойчивости к сбоям.
+«Заказ товара на маркетплейсе» — это техническое решение для системы оформления заказов в B2C-маркетплейсе с многими селлерами. Проект сосредоточен на критическом пути от инициации чекаута до подтверждения оплаты заказа. Архитектура построена с учётом высоких нагрузок (целевая аудитория 30 млн MAU, до 150 RPS на запись в пиковых сценариях), требований к финансовой консистентности и устойчивости к сбоям.
 
-Ключевые архитектурные принципы: микросервисная декомпозиция с изоляцией хранилищ, CQRS-разделение записи и чтения через event-driven обновление read-model, распределённая транзакция через паттерн Saga с явными компенсациями, идемпотентность всех изменяющих операций на нескольких уровнях, и Transactional Outbox для надёжной интеграции с Kafka.
+Ключевые архитектурные принципы: микросервисная декомпозиция с изоляцией хранилищ, распределённая транзакция через паттерн Saga с явными компенсациями, идемпотентность всех изменяющих операций на нескольких уровнях, и Transactional Outbox для надёжной интеграции с Kafka.
 
 ---
 
@@ -16,15 +16,12 @@
 | Покупатель (Customer) | Зарегистрированный пользователь, оформляющий заказы. |
 | Селлер (Seller) | Внешний продавец, имеющий товары на маркетплейсе. В рамках scope — внешний субъект. |
 | Заказ (Order) | Агрегатная сущность верхнего уровня, объединяющая покупки покупателя у разных селлеров в рамках одной транзакции оформления. |
-| Подзаказ (Suborder) | Часть заказа, относящаяся к одному селлеру/складу. Имеет независимый жизненный цикл (сборка, отгрузка, доставка). |
+| Подзаказ (Suborder) | Часть заказа, относящаяся к одному селлеру/складу. |
 | Чекаут (Checkout) | Процесс оформления заказа от нажатия «Оформить» до перенаправления на платёжную страницу. |
 | Inventory Reservation | Временная блокировка остатка товара на время от создания заказа до его оплаты. |
 | Idempotency-Key | Уникальный идентификатор запроса от клиента, обеспечивающий безопасный повтор операций без дублирования. |
 | Saga | Паттерн распределённой транзакции через последовательность локальных транзакций в разных сервисах с компенсирующими действиями при сбоях. |
 | Transactional Outbox | Паттерн надёжной публикации событий: запись события в outbox-таблицу в рамках транзакции БД, асинхронная публикация в брокер отдельным процессом. |
-| CQRS (Command Query Responsibility Segregation) | Разделение записи (command side) и чтения (query side) с независимыми моделями данных. |
-| Read-Model | Денормализованная проекция данных, оптимизированная для чтения. Обновляется асинхронно через события. |
-| Order Projector | Сервис, обновляющий read-model на основе событий из Kafka. |
 | CDC (Change Data Capture) | Технология (Debezium) для отслеживания изменений в БД через WAL и публикации их в брокер. |
 | At-least-once delivery | Гарантия, что сообщение будет доставлено как минимум один раз; возможны дубликаты, обрабатываемые на стороне consumer'а через идемпотентность. |
 | Eventual consistency | Модель согласованности, при которой данные в разных узлах системы согласуются спустя некоторое время. |
@@ -51,11 +48,7 @@
 
 **ФТ-5. Обработка таймаута оплаты.** Если за 15 минут оплата не пришла, заказ автоматически отменяется, резерв товаров снимается.
 
-**ФТ-6. Обработка событий жизненного цикла подзаказа.** Когда внешняя система (склад/доставка) сообщает о смене статуса подзаказа, система обновляет статус и пересчитывает агрегатный статус заказа.
-
-**ФТ-7. Получение статуса заказа.** Пользователь может запросить актуальный статус оформленного заказа: общий статус, статусы подзаказов, трек-номера, ожидаемая дата доставки.
-
-**Out of scope:** изменение состава заказа после создания, отмена покупателем, отмена селлером, возвраты и споры, антифрод, KYC, управление селлерами, промокоды и бонусные программы, мульти-валютность.
+**Out of scope:** изменение состава заказа после создания, отмена покупателем, отмена селлером, возвраты и споры, антифрод, KYC, управление селлерами, промокоды и бонусные программы, мульти-валютность, **обработка событий жизненного цикла подзаказа после оплаты (фулфилмент)**, **просмотр и чтение статусов заказов пользователем**.
 
 ---
 
@@ -74,29 +67,22 @@
 
 | Операция | Пиковый RPS | Тип |
 |---|---|---|
-| Чтение состояния заказа | 10 000 | Read |
 | Создание заказа | 150 | Write |
 | Webhook'и от платежей | 150 | Write |
-| События от складов/доставки | 500 | Write |
 | Попытки резервирования | 500 | Write |
-
-Соотношение чтение/запись ~67:1 — read-heavy профиль, обосновывающий CQRS.
 
 ### 4.3. Latency-цели
 
 **Синхронные операции:**
 - Открытие чекаута: P95 ≤ 500 мс
 - Создание заказа: P95 ≤ 1000 мс
-- Получение статуса заказа: P95 ≤ 200 мс
 
 **Асинхронные операции:**
 - Обработка callback платежа → обновление статуса: P95 ≤ 5 сек
-- Передача заказа на склад: P95 ≤ 30 сек
 
 ### 4.4. Доступность
 
-- Чекаут: **99.95%** (~4.5 часа простоя в год). Критический путь.
-- Чтение статуса: **99.9%**.
+- Чекаут и создание заказа: **99.95%** (~4.5 часа простоя в год). Критический путь.
 - Интеграции со складами: **99%** (допустима деградация).
 
 ### 4.5. Корректность и надёжность
@@ -117,22 +103,22 @@
 3. Покупатель выбирает адрес доставки и способ оплаты.
 4. Покупатель нажимает «Перейти к оплате».
 5. Система резервирует выбранные товары, создаёт заказ, инициирует оплату, перенаправляет на страницу оплаты.
-6. Покупатель оплачивает заказ и возвращается в приложение.
-7. Покупатель видит подтверждение оформления и актуальный статус («Заказ принят, ожидает оплаты» → через несколько секунд «Оплачен»).
+6. Покупатель оплачивает заказ на стороне провайдера.
+7. Система получает webhook от провайдера, переводит заказ в статус `PAID` и передаёт его на склады для фулфилмента.
 
 **Альтернативные ветки:**
 - 2a. Товар стал недоступен → предупреждение, предложение убрать.
 - 2b. Цена товара изменилась → новая цена + подтверждение.
 - 5a. Не удалось зарезервировать товар → ошибка, заказ не создаётся.
-- 7a. Покупатель не оплатил в течение 15 минут → автоматическая отмена, снятие резервов, уведомление.
+- 6a. Покупатель не оплатил в течение 15 минут → автоматическая отмена, снятие резервов.
 
 ---
 
 ## 6. Модель данных
 
-В системе используется четыре независимых хранилища: основная БД OMS (write side), read-model БД OMS (read side), БД Inventory Service, и небольшая БД Payment Adapter для idempotency-лога.
+В системе используется три независимых хранилища: основная БД OMS, БД Inventory Service, и небольшая БД Payment Adapter для idempotency-лога.
 
-### 6.1. OMS Write Side (основная БД заказов)
+### 6.1. OMS (основная БД заказов)
 
 ```mermaid
 erDiagram
@@ -142,7 +128,7 @@ erDiagram
         uuid id PK "UUIDv7-like с зашитым shard_id"
         uuid customer_id
         varchar idempotency_key "часть UNIQUE с customer_id"
-        varchar status "CREATED, PENDING_PAYMENT, PAID, PROCESSING, SHIPPING, COMPLETED, CANCELLED, FAILED, PAID_LATE"
+        varchar status "CREATED, PENDING_PAYMENT, PAID, CANCELLED, FAILED, PAID_LATE"
         decimal total_amount
         jsonb delivery_address "embedded snapshot"
         timestamp created_at "partition key"
@@ -155,10 +141,9 @@ erDiagram
         uuid order_id FK
         uuid seller_id
         uuid warehouse_id
-        varchar status "PAID, PACKING, SHIPPED, DELIVERED, CANCELLED"
+        varchar status "CREATED, PAID, CANCELLED"
         decimal items_amount
         decimal delivery_amount
-        varchar tracking_number "nullable"
         timestamp created_at
         timestamp updated_at
     }
@@ -215,38 +200,12 @@ erDiagram
 - **`reservation_id` без FK** — cross-service ссылка на резерв в БД Inventory.
 - **`provider_callback_idempotency_key`** — защита от повторной обработки webhook'ов.
 - **`OUTBOX_EVENT`** — Transactional Outbox: записи добавляются в той же транзакции, что и бизнес-данные. Debezium читает Postgres WAL и публикует в Kafka.
+- **Статусы упрощены**: жизненный цикл заказа доводится только до `PAID`. События склада/доставки и переходы `PROCESSING/SHIPPING/COMPLETED` вне scope.
 
 **Шардирование:** по `customer_id` (зашитый в UUID). Все заказы одного покупателя — на одном шарде.
 **Партиционирование:** по `created_at` (по месяцам).
 
-### 6.2. OMS Read Side (read-model для чтения)
-
-```mermaid
-erDiagram
-    ORDERS_VIEW {
-        uuid order_id PK
-        uuid customer_id
-        varchar aggregated_status
-        decimal total_amount
-        jsonb suborders_snapshot "массив подзаказов с их статусами"
-        jsonb delivery_address
-        int items_count
-        varchar first_item_image_url
-        timestamp created_at
-        timestamp last_status_changed_at
-        bigint version
-    }
-```
-
-**Ключевые решения:**
-- Один документ на заказ — никаких джойнов при чтении.
-- `suborders_snapshot` как JSONB — все подзаказы в одной записи.
-- Денормализация для превью (image_url, items_count) — без обращений к каталогу.
-- `version` — монотонный счётчик из source side для защиты от out-of-order events.
-- Шардирование тем же ключом, что и write side (`customer_id`).
-- Каждый шард имеет master + 3 read replicas для обработки 10k RPS на чтение.
-
-### 6.3. Inventory Service
+### 6.2. Inventory Service
 
 ```mermaid
 erDiagram
@@ -284,7 +243,7 @@ reservation:{reservation_id} → hash, TTL 900 сек
 
 **Сверка Redis ↔ БД:** фоновый процесс Inventory Reconciler раз в 5 минут считает в БД сумму активных резервов и сверяет с Redis-счётчиком. При расхождении переписывает Redis из БД.
 
-### 6.4. Payment Adapter (служебная БД)
+### 6.3. Payment Adapter (служебная БД)
 
 Маленькая БД для idempotency webhook'ов и Outbox. Не хранит сами `PAYMENT` (они в OMS).
 
@@ -319,21 +278,16 @@ erDiagram
 
 **2. Checkout Service** — синхронный сервис чекаута. Открывает чекаут (read-heavy с параллельными вызовами) и оркестрирует Saga при создании заказа.
 
-**3. Order Management Service (OMS)** — хозяин жизненного цикла заказов. Хранит заказы, обрабатывает события статусов, публикует бизнес-события через Outbox.
+**3. Order Management Service (OMS)** — хозяин жизненного цикла заказов в части оформления. Хранит заказы, обрабатывает событие оплаты, публикует бизнес-события через Outbox.
 
 **4. Inventory Service** — управление резервированием товаров. gRPC API: `Reserve`, `Release`, `Confirm`. Redis для горячего пути + PostgreSQL для аудита.
 
 **5. Payment Adapter** — обёртка над платёжным провайдером. Инициация платежей, приём и нормализация webhook'ов, публикация в Kafka через Outbox.
 
-**6. Order Projector** — Kafka consumer, обновляющий read-model на основе событий из OMS.
-
-**7. Order Query Service** — синхронный сервис чтения. Читает только из read-model.
-
-**8. Lifecycle Worker** — фоновый сервис для отложенных операций. Развёртывается как пул реплик с использованием `FOR UPDATE SKIP LOCKED`.
+**6. Lifecycle Worker** — фоновый сервис для отложенных операций (отмена неоплаченных заказов). Развёртывается как пул реплик с использованием `FOR UPDATE SKIP LOCKED`.
 
 **Инфраструктура:**
-- PostgreSQL OMS Cluster (sharded by customer_id) — 8 шардов × (master + 3 replicas).
-- PostgreSQL Read-Model Cluster (sharded by customer_id) — 8 шардов × (master + 3 replicas).
+- PostgreSQL OMS Cluster (sharded by customer_id) — 8 шардов × (master + 1 replica для отказоустойчивости).
 - PostgreSQL Inventory Cluster (sharded by sku/warehouse).
 - PostgreSQL Payment Adapter DB.
 - Redis Cluster для Inventory.
@@ -368,17 +322,14 @@ graph TB
         OMS[Order Management]
         Inventory[Inventory Service]
         PayAdapter[Payment Adapter]
-        QueryAPI[Order Query]
-        Projector[Order Projector]
         Worker[Lifecycle Worker]
     end
 
     subgraph Storage
-        OMS_DB[(PostgreSQL<br/>OMS)]
-        Read_DB[(PostgreSQL<br/>Read-model)]
-        Inv_DB[(PostgreSQL<br/>Inventory)]
-        Inv_Redis[(Redis<br/>Inventory hot path)]
-        PA_DB[(PostgreSQL<br/>PayAdapter)]
+        OMS_DB[(PostgreSQL OMS)]
+        Inv_DB[(PostgreSQL Inventory)]
+        Inv_Redis[(Redis Inventory hot path)]
+        PA_DB[(PostgreSQL PayAdapter)]
     end
 
     subgraph Bus
@@ -390,7 +341,6 @@ graph TB
     Web --> Gateway
     Gateway -.-> Auth
     Gateway --> Checkout
-    Gateway --> QueryAPI
     Gateway --> PayAdapter
 
     Checkout --> Catalog
@@ -412,15 +362,8 @@ graph TB
     Debezium --> Kafka
 
     Kafka --> OMS
-    Kafka --> Projector
-    Kafka --> Worker
     Kafka --> Notify
     Kafka --> Warehouse
-    Warehouse -- events --> Kafka
-    Delivery -- events --> Kafka
-
-    Projector --> Read_DB
-    QueryAPI --> Read_DB
 
     Worker --> OMS_DB
 ```
@@ -432,15 +375,13 @@ graph TB
 | Checkout vs OMS | Разный профиль: Checkout — синхронный оркестратор Saga, OMS — write-heavy event-driven хозяин жизненного цикла. |
 | Inventory vs OMS | Своё хранилище (Redis), специфичная нагрузка, шардирование по другому ключу. |
 | Payment Adapter vs OMS | Изоляция внешней зависимости. При смене провайдера — меняется только адаптер. |
-| Query vs OMS | Классический CQRS. Read/write ratio 67:1, разные паттерны масштабирования. |
-| Projector vs Query | Projector — write-side для read-model, Query — read-side. Изоляция нагрузок. |
 | Lifecycle Worker | Фоновые задачи изолированы от user-facing OMS. |
 
 ### 7.4. Sync vs Async и транспорт
 
-**Синхронные пути (юзер ждёт):** Mobile/Web → Gateway → Checkout → Inventory + OMS + Payment Adapter; Mobile/Web → Gateway → QueryAPI → Read-model.
+**Синхронные пути (юзер ждёт):** Mobile/Web → Gateway → Checkout → Inventory + OMS + Payment Adapter.
 
-**Асинхронные пути (через Kafka):** OMS → Outbox → Kafka → Projector / Notification / Warehouse; Payment Adapter → Outbox → Kafka → OMS; Warehouse/Delivery → Kafka → OMS; Worker → OMS_DB → Outbox → Kafka.
+**Асинхронные пути (через Kafka):** Payment Adapter → Outbox → Kafka → OMS (обработка PaymentReceived); OMS → Outbox → Kafka → внешние подписчики (Warehouse, Notification); Worker → OMS_DB → Outbox → Kafka.
 
 **Принцип:** критический путь «оформить → оплатить» — синхронно. После оплаты — async.
 
@@ -454,7 +395,7 @@ graph TB
 1. **Клиент → Checkout**: `Idempotency-Key` + UNIQUE в `orders.idempotency_key`.
 2. **Payment Adapter → Provider**: свой UUID, отправляемый провайдеру.
 3. **Provider → нас**: `event_id` + UNIQUE в `webhook_events`.
-4. **Kafka consumers**: idempotent processing через статусные проверки и версионирование.
+4. **Kafka consumers**: idempotent processing через статусные проверки.
 
 ---
 
@@ -542,7 +483,7 @@ sequenceDiagram
 
 ### 8.3. Обработка callback оплаты
 
-Webhook от провайдера → дедупликация → Outbox → Kafka → OMS consumer → events fan-out.
+Webhook от провайдера → дедупликация → Outbox → Kafka → OMS consumer → fan-out событий.
 
 **Sequence-диаграмма (счастливый путь):**
 
@@ -556,7 +497,7 @@ sequenceDiagram
     participant OMS
     participant OMSDB as OMS DB
     participant Inventory
-    participant Projector
+    participant Warehouse as External Warehouse
 
     Provider->>Gateway: POST /webhooks/payment {event_id, status}
     Gateway->>Gateway: Verify HMAC
@@ -578,12 +519,14 @@ sequenceDiagram
     OMS->>OMSDB: COMMIT
     OMS-->>Kafka: ACK
 
+    Note over OMSDB, Kafka: Debezium публикует outbox → Kafka
+
     par Параллельная обработка
         Kafka->>Inventory: ConfirmReservations
-        Inventory->>Inventory: status RESERVED → CONFIRMED в Inventory DB
+        Inventory->>Inventory: status ACTIVE → CONFIRMED в БД, обновление stock
     and
-        Kafka->>Projector: OrderPaid
-        Projector->>Projector: UPDATE orders_view в Read-Model DB
+        Kafka->>Warehouse: DispatchToWarehouses
+        Note over Warehouse: внешний consumer, начинает фулфилмент
     end
 ```
 
@@ -591,14 +534,13 @@ sequenceDiagram
 
 - **Дубль webhook от провайдера** (retry): `INSERT webhook_events ... ON CONFLICT DO NOTHING` возвращает 0 rows → отвечаем 200 OK без повторной публикации в Kafka.
 - **Двойная обработка Kafka consumer'ом** (retry после сбоя): `SELECT payment FOR UPDATE`, проверяем статус. Если уже SUCCEEDED — ACK без действий.
-- **Race с Lifecycle Worker** (worker уже отменил заказ): подробно в разделе 8.6 «Особые случаи».
+- **Race с Lifecycle Worker** (worker уже отменил заказ): подробно в разделе 8.5 «Особые случаи».
 
 **Highload-аспекты:**
 - **Idempotency на двух уровнях**: `event_id` в `webhook_events` (от провайдера) и `provider_payment_id` в `payments` (для Kafka retry).
 - **At-least-once delivery + idempotent processing = effective exactly-once.**
-- **Async fan-out через Kafka**: одно событие OrderPaid → 3+ параллельных подписчика, развязанных во времени.
+- **Async fan-out через Kafka**: одно событие OrderPaid → подписчики (Inventory confirm, внешний Warehouse, Notification), развязанные во времени.
 - **Transactional Outbox в Payment Adapter**: webhook не теряется даже при сбое адаптера между ответом провайдеру и публикацией.
-- **Eventual consistency**: от COMMIT до видимости в read-model — типично <1 сек.
 
 ### 8.4. Таймаут оплаты (Lifecycle Worker)
 
@@ -644,55 +586,7 @@ sequenceDiagram
 - **Идемпотентность Inventory consumer**: проверка `status='ACTIVE'` перед UPDATE.
 - **Bottleneck-анализ**: 8 шардов × 30 batch'ей/мин × 100 заказов = 24000/мин = 400/сек. Запас 10x от пиковых отмен.
 
-### 8.5. Обработка событий жизненного цикла + чтение статуса
-
-End-to-end путь: событие от внешнего склада → write side OMS → Outbox → Kafka → projector → read-model → query API → пользователь.
-
-**Sequence-диаграмма (две части):**
-
-```mermaid
-sequenceDiagram
-    participant Warehouse as Внешний склад
-    participant Kafka
-    participant OMS
-    participant OMSDB as OMS DB
-    participant Projector
-    participant ReadDB as Read-Model DB
-    participant Client
-    participant QueryAPI as Order Query
-
-    Note over Warehouse, ReadDB: Часть 1: обработка события
-    Warehouse->>Kafka: SuborderShipped(suborder_id, tracking, customer_id)
-    Kafka->>OMS: consume
-    OMS->>OMSDB: BEGIN
-    OMS->>OMSDB: UPDATE suborders SET status='SHIPPED'
-    OMS->>OMSDB: SELECT array_agg(status) FROM suborders WHERE order_id=?
-    OMS->>OMS: compute_order_status() → 'PROCESSING'
-    OMS->>OMSDB: UPDATE orders SET status='PROCESSING'
-    OMS->>OMSDB: INSERT outbox_events (SuborderStatusChanged)
-    OMS->>OMSDB: COMMIT
-
-    Note over OMSDB, Projector: Debezium → Kafka
-    Kafka->>Projector: SuborderStatusChanged
-    Projector->>ReadDB: UPDATE orders_view (with version check)
-
-    Note over Client, ReadDB: Часть 2: чтение (10k RPS)
-    Client->>QueryAPI: GET /orders/{order_id}
-    QueryAPI->>ReadDB: SELECT * FROM orders_view WHERE order_id=? AND customer_id=?
-    ReadDB-->>QueryAPI: order data
-    QueryAPI-->>Client: 200 OK
-```
-
-**Обработка дублей событий:** перед `UPDATE suborders` делается `SELECT ... FOR UPDATE` с проверкой текущего статуса. Если уже `SHIPPED` или дальше по lifecycle — ACK без действий (повторное событие из retry consumer'а).
-
-**Highload-аспекты:**
-- **Read path полностью изолирован от write**: Query Service не имеет доступа к OMS_DB.
-- **Шардирование = отсутствие scatter**: запрос с `customer_id` в JWT → прямой роутинг в нужный шард.
-- **Versioning против out-of-order events**: Projector обновляет read-model только если версия события больше последней применённой.
-- **Read replicas для масштабирования чтения**: 10k RPS распределяется на 8 × 3 = 24 реплики ≈ 400 RPS на реплику.
-- **Eventual consistency**: лаг от COMMIT до видимости — миллисекунды-секунды.
-
-### 8.6. Особые случаи
+### 8.5. Особые случаи
 
 #### Случай 1: Race между Lifecycle Worker и webhook оплаты
 
@@ -701,7 +595,7 @@ sequenceDiagram
 **Решение:**
 1. Buffer 2 минуты в Worker'е: `payment_deadline < now() - interval '2 minutes'`.
 2. Условный UPDATE при обработке webhook: `WHERE status IN ('CREATED', 'PENDING_PAYMENT')`.
-3. Ветка `PAID_LATE`: при 0 rows обновлено — заказ переводится в `PAID_LATE`, инициируется автоматический возврат денег у провайдера, пользователь получает извинительное уведомление.
+3. Ветка `PAID_LATE`: при 0 rows обновлено — заказ переводится в `PAID_LATE`, инициируется автоматический возврат денег у провайдера.
 
 **Trade-off:** consistency над availability. Лучше редкий «опоздавший платёж» с автоматическим refund, чем потерянная оплата.
 
@@ -712,7 +606,7 @@ sequenceDiagram
 **Решение:**
 - В `payments` unique constraint на `provider_callback_idempotency_key`.
 - Перед обновлением OMS делает `SELECT ... FOR UPDATE`. Если уже SUCCEEDED — ACK без действий.
-- Аналогично для Inventory (`status='ACTIVE'`) и Projector (version check).
+- Аналогично для Inventory (`status='ACTIVE'`).
 
 **Гарантия:** at-least-once delivery + idempotent processing = effective exactly-once.
 
@@ -720,9 +614,9 @@ sequenceDiagram
 
 ## 9. Компромиссы и ограничения
 
-1. **Saga вместо 2PC** — распределённые транзакции через сагу с компенсациями. 2PC отвергнут из-за внешнего провайдера платежей.
-2. **Eventual consistency между write и read side** допустима в пределах <1 сек. Цена — короткое окно расхождения статуса для пользователя.
-3. **Hybrid storage Inventory (Redis + Postgres)**. Redis — горячий путь, БД — source of truth. Цена — окно расхождения до 5 минут, разрешаемое Reconciler'ом. В этом окне теоретически возможны минорные oversell, разрешаемые операционно.
+1. **Scope строго ограничен оформлением.** Не моделируются: чтение/просмотр заказов пользователем, обработка событий жизненного цикла подзаказа после оплаты (фулфилмент), отмена покупателем, возвраты. Это позволяет глубже проработать критический путь оформления.
+2. **Saga вместо 2PC** — распределённые транзакции через сагу с компенсациями. 2PC отвергнут из-за внешнего провайдера платежей.
+3. **Hybrid storage Inventory (Redis + Postgres)**. Redis — горячий путь, БД — source of truth. Цена — окно расхождения до 5 минут, разрешаемое Reconciler'ом.
 4. **Полное шардирование с самого начала.** Нагрузка пограничная для одной ноды, но шардирование обосновано как стратегическое решение под рост и распродажные пики ×5–10.
 5. **Outbox + Debezium вместо прямой публикации в Kafka.** Цена — лаг публикации (миллисекунды), выигрыш — гарантия at-least-once для финансовых событий.
 6. **Замена платёжного провайдера** возможна без изменения OMS — только через замену Payment Adapter.
