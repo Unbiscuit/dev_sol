@@ -398,26 +398,88 @@ graph TB
 
 ## 8. Технические сценарии
 
-### 8.1. Открытие чекаута
+### 8.1. Открытие чекаута (Read, ~150 RPS пиково)
 
-Read-only сценарий построения preview без создания заказа. 5 параллельных вызовов внешних сервисов (Cart, User, Catalog, Inventory, Delivery) обязательны для P95 ≤ 500 мс.
+Построение preview без создания заказа. Параллельные вызовы внешних сервисов обязательны для соблюдения P95 ≤ 500 мс.
 
 **Алгоритм:**
-1. Параллельно: получить корзину из Cart Service и адреса из User Service.
-2. Параллельно: получить актуальные данные товаров (цена, селлер, склад) из Catalog и проверить доступность из Inventory (`GET stock:{sku}:{warehouse}` в Redis, без блокировок).
-3. Сгруппировать items по селлерам/складам.
-4. Параллельно для каждой группы: рассчитать стоимость доставки в Delivery Service.
-5. Собрать preview, сравнить цены с теми, что были в корзине, добавить warnings о расхождениях.
-6. Вернуть клиенту.
+
+1. Клиент отправляет в API Gateway запрос `GET /checkout`.
+2. Gateway перенаправляет запрос в Checkout Service.
+3. Checkout параллельно запрашивает корзину из Cart Service и адреса доставки из User Service.
+4. Checkout параллельно запрашивает актуальные данные товаров (цена, селлер, склад) из Catalog Service и проверяет доступность в Inventory Service (быстрый `GET` по Redis-счётчикам, без блокировок).
+5. Checkout группирует items по селлерам и складам.
+6. Checkout параллельно для каждой группы запрашивает стоимость доставки в Delivery Service.
+7. Checkout формирует preview (товары, цены, доставка, итоговая сумма), сравнивает цены с теми, что были в корзине, добавляет warnings о расхождениях.
+8. Preview возвращается клиенту.
+
+**Sequence-диаграмма:**
+
+```mermaid
+sequenceDiagram
+    participant Client
+    participant Gateway as API Gateway
+    participant Checkout
+    participant Cart as Cart Service
+    participant User as User Service
+    participant Catalog as Catalog Service
+    participant Inventory
+    participant InvRedis as Redis
+    participant Delivery as Delivery Service
+
+    Client->>Gateway: GET /checkout
+    Gateway->>Checkout: gRPC GetCheckoutPreview(customer_id)
+
+    par Параллельно
+        Checkout->>Cart: GetCart(customer_id)
+        Cart-->>Checkout: items
+    and
+        Checkout->>User: GetAddresses(customer_id)
+        User-->>Checkout: addresses
+    end
+
+    par Параллельно
+        Checkout->>Catalog: GetProducts(skus)
+        Catalog-->>Checkout: products with price, seller, warehouse
+    and
+        Checkout->>Inventory: CheckAvailability(skus)
+        Inventory->>InvRedis: GET stock keys (batch)
+        InvRedis-->>Inventory: availability map
+        Inventory-->>Checkout: availability
+    end
+
+    Checkout->>Checkout: Group items by seller and warehouse
+
+    par Параллельно для каждой группы
+        Checkout->>Delivery: CalculateCost(warehouse, address, items)
+        Delivery-->>Checkout: cost, ETA
+    end
+
+    Checkout->>Checkout: Build preview, compare prices, add warnings
+    Checkout-->>Gateway: CheckoutPreview
+    Gateway-->>Client: 200 OK
+```
 
 **Highload-аспекты:**
-- Параллелизация снижает latency с суммы (~250 мс) до максимума (~50 мс).
+
+- Параллелизация снижает latency с суммы (~250 мс) до максимума (~50 мс) среди вызовов.
 - Read-only характер позволяет неограниченно масштабировать Checkout Service горизонтально.
-- Graceful degradation: при недоступности Delivery — placeholder; при недоступности Catalog/Cart — fail-fast.
+- Graceful degradation: при недоступности Delivery — preview возвращается с placeholder стоимости доставки; при недоступности Catalog или Cart — fail-fast.
 
-### 8.2. Создание заказа
+### 8.2. Создание заказа (Write, 150 RPS пиково)
 
-Saga из 3 шагов с компенсациями: Reserve → CreateOrder → InitiatePayment.
+Saga из трёх шагов с явными компенсациями: Reserve → CreateOrder → InitiatePayment.
+
+**Алгоритм:**
+
+1. Клиент отправляет в API Gateway запрос `POST /checkout` с телом `{items, address, Idempotency-Key}`.
+2. Gateway перенаправляет запрос в Checkout Service.
+3. Checkout проверяет идемпотентность через OMS: если заказ с этим ключом уже создан — возвращает существующий `payment_url`.
+4. Checkout вызывает `Inventory.Reserve` — резервирует все товары атомарно через Lua-скрипт в Redis.
+5. Checkout вызывает `OMS.CreateOrder` — создаёт заказ, подзаказы, items и outbox-событие в одной локальной транзакции PostgreSQL.
+6. Checkout вызывает `PaymentAdapter.InitiatePayment` — провайдер возвращает `payment_url`.
+7. Checkout фиксирует payment в OMS, переводит заказ в `PENDING_PAYMENT`.
+8. Клиенту возвращается `payment_url` для перенаправления на страницу оплаты.
 
 **Sequence-диаграмма:**
 
@@ -465,22 +527,34 @@ sequenceDiagram
 
 **Обработка ошибок:**
 
-- **Дубль idempotency-ключа:** `CheckIdempotency` возвращает существующий заказ → клиенту возвращается прежний `payment_url` без побочных действий.
+- **Дубль idempotency-ключа:** `CheckIdempotency` возвращает существующий заказ — клиенту возвращается прежний `payment_url` без побочных действий.
 - **OUT_OF_STOCK:** Inventory при провале Lua-скрипта откатывает (`INCRBY`) уже сделанные DECRBY и возвращает ошибку. Checkout отвечает клиенту 409 Conflict, заказа нет.
-- **OMS падает после Reserve:** Checkout вызывает `Inventory.Release(reservation_ids)` как компенсацию. Возвращает 500.
+- **OMS падает после Reserve:** Checkout вызывает `Inventory.Release(reservation_ids)` как компенсацию, возвращает 500.
 - **Provider не ответил (timeout):** Checkout переводит заказ в `PAYMENT_INITIATION_FAILED`, **не отпускает резерв** (риск oversell, если запрос всё-таки прошёл к провайдеру). Lifecycle Worker через 15+2 минут гарантированно разберётся.
 - **Provider ответил отказом:** Checkout вызывает `Inventory.Release`, переводит заказ в `FAILED`, возвращает клиенту 400.
 
 **Highload-аспекты:**
+
 - **Конкуренция за hot products** решается атомарным Lua-скриптом в Redis: операции по одному ключу сериализуются на уровне Redis-shard за микросекунды без блокировок в БД.
-- **Многослойная идемпотентность**: `Idempotency-Key` от клиента + собственный idempotent key Payment Adapter → Provider.
-- **Saga с явными компенсациями.**
+- **Многослойная идемпотентность**: `Idempotency-Key` от клиента + собственный idempotent key от Payment Adapter к провайдеру.
+- **Saga с явными компенсациями** покрывает сбои на любом шаге.
 - **Outbox pattern**: `outbox_events` пишется в той же транзакции, что и `orders`.
 - **Bottleneck-анализ**: внешний провайдер (~500 мс) — главный bottleneck латентности; БД OMS на одном шарде имеет запас 10x; Redis Inventory имеет запас 100x.
 
-### 8.3. Обработка callback оплаты
+### 8.3. Обработка callback оплаты (Async Write, 150 RPS пиково)
 
-Webhook от провайдера → дедупликация → Outbox → Kafka → OMS consumer → fan-out событий.
+Webhook от провайдера → дедупликация → Outbox → Kafka → OMS consumer → fan-out событий подписчикам.
+
+**Алгоритм:**
+
+1. Платёжный провайдер отправляет на URL `/webhooks/payment` HTTP POST с телом `{event_id, status, payment_id, ...}`.
+2. API Gateway верифицирует HMAC-подпись и перенаправляет запрос в Payment Adapter.
+3. Payment Adapter в одной транзакции вставляет запись в `webhook_events` (через `ON CONFLICT DO NOTHING` для дедупликации) и пишет событие `PaymentReceived` в свой outbox.
+4. Payment Adapter отвечает Gateway 200 OK, Gateway — провайдеру 200 OK.
+5. Debezium читает WAL Payment Adapter DB и публикует событие `PaymentReceived` в Kafka.
+6. OMS как Kafka consumer обрабатывает событие: в одной транзакции обновляет статус заказа в `PAID`, статус платежа в `SUCCEEDED`, пишет в outbox события `OrderPaid`, `ConfirmReservations`, `DispatchToWarehouses`.
+7. Debezium публикует эти события в соответствующие Kafka-топики.
+8. Параллельно их обрабатывают подписчики: Inventory переводит резервы из `ACTIVE` в `CONFIRMED`, внешний склад начинает фулфилмент, Notification Service шлёт push пользователю.
 
 **Sequence-диаграмма:**
 
@@ -529,19 +603,28 @@ sequenceDiagram
 
 **Обработка ошибок и дублей:**
 
-- **Дубль webhook от провайдера**: `INSERT webhook_events ... ON CONFLICT DO NOTHING` возвращает 0 rows → отвечаем 200 OK без повторной публикации в Kafka.
-- **Двойная обработка Kafka consumer'ом**: `SELECT payment FOR UPDATE`, проверяем статус. Если уже SUCCEEDED — ACK без действий.
+- **Дубль webhook от провайдера**: `INSERT webhook_events ... ON CONFLICT DO NOTHING` возвращает 0 rows — отвечаем 200 OK без повторной публикации в Kafka.
+- **Двойная обработка Kafka consumer'ом**: `SELECT payment FOR UPDATE`, проверка статуса. Если уже `SUCCEEDED` — ACK без действий.
 - **Race с Lifecycle Worker** (worker уже отменил заказ): подробно в разделе 8.5 «Особые случаи».
 
 **Highload-аспекты:**
-- **Idempotency на двух уровнях**: `event_id` в `webhook_events` (от провайдера) и `provider_payment_id` в `payments` (для Kafka retry).
+
+- **Idempotency на двух уровнях**: `event_id` в `webhook_events` от провайдера и `provider_callback_idempotency_key` в `payments` для защиты от повторной обработки в Kafka.
 - **At-least-once delivery + idempotent processing = effective exactly-once.**
-- **Async fan-out через Kafka**: одно событие OrderPaid → подписчики (Inventory confirm, внешний Warehouse, Notification), развязанные во времени.
-- **Transactional Outbox в Payment Adapter**: webhook не теряется даже при сбое адаптера между ответом провайдеру и публикацией.
+- **Async fan-out через Kafka**: одно событие `OrderPaid` порождает обработку у нескольких подписчиков, развязанных во времени.
+- **Transactional Outbox в Payment Adapter**: webhook не теряется даже при сбое адаптера между ответом провайдеру и публикацией в Kafka.
 
-### 8.4. Таймаут оплаты (Lifecycle Worker)
+### 8.4. Таймаут оплаты (Background, периодический)
 
-Polling по шардам с конкурентным доступом через `FOR UPDATE SKIP LOCKED`. Buffer 2 минуты для исключения race с поздним webhook. Release резервов через Kafka.
+Lifecycle Worker отменяет заказы, по которым не пришла оплата в течение 15+2 минут. Polling по шардам с конкурентным доступом через `FOR UPDATE SKIP LOCKED`. Release резервов через Kafka.
+
+**Алгоритм:**
+
+1. Lifecycle Worker по таймеру (каждые 30 секунд) обращается к шарду OMS DB и выбирает заказы со статусом `PENDING_PAYMENT` и истёкшим `payment_deadline` (минус 2 минуты buffer от race с поздним webhook).
+2. Запрос использует `FOR UPDATE SKIP LOCKED LIMIT 100` — несколько worker-инстансов могут безопасно работать конкурентно.
+3. Для каждого заказа в batch worker открывает транзакцию: переводит заказ в `CANCELLED` с дополнительной проверкой `status='PENDING_PAYMENT'` (защита от race с webhook), переводит подзаказы в `CANCELLED`, пишет событие `OrderCancelled` в outbox, коммитит.
+4. Debezium публикует `OrderCancelled` в Kafka.
+5. Inventory как consumer обрабатывает событие: для каждого `reservation_id` проверяет статус `ACTIVE`, переводит в `RELEASED` в БД, делает `INCRBY` стока в Redis.
 
 **Sequence-диаграмма:**
 
@@ -573,15 +656,16 @@ sequenceDiagram
     end
 ```
 
-**Обработка race condition:** при `UPDATE orders` дополнительно `WHERE status='PENDING_PAYMENT'`. Если вернулось 0 строк — webhook опередил Worker'а, пропускаем (заказ уже в `PAID`).
+**Обработка race condition:** при `UPDATE orders` дополнительный фильтр `WHERE status='PENDING_PAYMENT'`. Если вернулось 0 строк — webhook опередил Worker'а, пропускаем (заказ уже в `PAID`).
 
 **Highload-аспекты:**
+
 - **`FOR UPDATE SKIP LOCKED`** — нативный паттерн PostgreSQL для конкурентной обработки заданий несколькими worker-инстансами без distributed lock.
 - **Batch size 100** — компромисс между overhead итераций и длительностью блокировок.
-- **Развёртывание как пул реплик** — любой worker берёт любой шард, естественная балансировка.
-- **Release через Kafka, а не gRPC**: Worker отвечает только за надёжную запись в OMS_DB + outbox; Inventory подхватывает асинхронно. Гарантия at-least-once.
+- **Развёртывание как пул реплик** — любой worker берёт любой шард, естественная балансировка через `SKIP LOCKED`.
+- **Release через Kafka, а не gRPC**: Worker отвечает только за надёжную запись в OMS_DB + outbox, Inventory подхватывает асинхронно. Гарантия at-least-once.
 - **Идемпотентность Inventory consumer**: проверка `status='ACTIVE'` перед UPDATE.
-- **Bottleneck-анализ**: 8 шардов × 30 batch'ей/мин × 100 заказов = 24000/мин = 400/сек. Запас 10x от пиковых отмен.
+- **Ёмкость**: 8 шардов × 30 batch'ей/мин × 100 заказов = 24 000/мин = 400/сек. Запас 10x от пиковых отмен.
 
 ### 8.5. Особые случаи
 
@@ -590,17 +674,30 @@ sequenceDiagram
 **Ситуация:** пользователь оплатил на 14:59 минуте. Worker мог успеть отменить заказ до того, как webhook от провайдера дошёл.
 
 **Решение:**
+
 1. Buffer 2 минуты в Worker'е: `payment_deadline < now() - interval '2 minutes'`.
 2. Условный UPDATE при обработке webhook: `WHERE status IN ('CREATED', 'PENDING_PAYMENT')`.
 3. Ветка `PAID_LATE`: при 0 rows обновлено — заказ переводится в `PAID_LATE`, инициируется автоматический возврат денег у провайдера.
 
 #### Случай 2: Двойная обработка webhook'а Kafka consumer'ом
 
-**Ситуация:** OMS-консьюмер обработал событие, успел COMMIT, но не успел ACK в Kafka (упал, рестарт). Kafka переотправит то же событие.
+**Ситуация:** OMS consumer обработал событие, успел COMMIT, но не успел ACK в Kafka (упал, рестарт). Kafka переотправит то же событие.
 
 **Решение:**
+
 - В `payments` unique constraint на `provider_callback_idempotency_key`.
-- Перед обновлением OMS делает `SELECT ... FOR UPDATE`. Если уже SUCCEEDED — ACK без действий.
-- Аналогично для Inventory (`status='ACTIVE'`).
+- Перед обновлением OMS делает `SELECT ... FOR UPDATE`. Если уже `SUCCEEDED` — ACK без действий.
+- Аналогично для Inventory (проверка `status='ACTIVE'`).
 
 **Гарантия:** at-least-once delivery + idempotent processing = effective exactly-once.
+
+---
+
+## 9. Архитектурные компромиссы
+
+1. **Saga вместо 2PC.** Распределённая транзакция «зарезервировать товар → создать заказ → инициировать оплату» реализована через сагу с явными компенсациями. 2PC неприменим, так как внешний платёжный провайдер не поддерживает участие в распределённых транзакциях.
+2. **Hybrid storage в Inventory (Redis + PostgreSQL).** Redis обеспечивает атомарные операции для конкурентного доступа (десятки тысяч RPS на ключ для популярных товаров), PostgreSQL — source of truth для аудита и восстановления. Согласованность поддерживается фоновым Reconciler'ом.
+3. **Шардирование с момента запуска.** При текущей нагрузке 150 RPS на запись одна нода справилась бы, однако шардирование обеспечивает запас под рост в 5–10 раз и упрощает горизонтальное масштабирование.
+4. **Outbox + Debezium вместо прямой публикации в Kafka.** Гарантирует at-least-once delivery финансовых событий: при недоступности Kafka событие сохраняется в БД и публикуется при восстановлении.
+5. **Изоляция платёжного провайдера через Payment Adapter.** Замена провайдера (например, ЮKassa → Stripe) затрагивает только адаптер; OMS и остальные сервисы не модифицируются.
+6. **Идемпотентность на нескольких уровнях.** Реализована на каждой сетевой границе (клиент↔Checkout, Adapter↔Provider, Provider↔Webhook, Kafka consumer'ы), что даёт effective exactly-once семантику поверх at-least-once delivery.
