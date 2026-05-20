@@ -356,7 +356,7 @@ graph TB
         Web[Web App]
     end
 
-    subgraph External["Внешние системы"]
+    subgraph External["internal service"]
         Catalog[Catalog Service]
         Auth[Auth Service]
         Warehouse[Warehouse / Fulfillment]
